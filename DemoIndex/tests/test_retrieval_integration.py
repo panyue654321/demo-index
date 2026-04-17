@@ -7,7 +7,6 @@ import json
 import os
 import unittest
 from io import StringIO
-from pathlib import Path
 from unittest.mock import patch
 
 from DemoIndex import retrieve_candidates
@@ -51,10 +50,10 @@ class RetrievalIntegrationTests(unittest.TestCase):
         os.environ["DATABASE_URL"] = cls.database_url
 
     def test_retrieve_candidates_returns_ranked_results(self) -> None:
-        """The retrieval API should return non-empty chunk, doc, and section results."""
+        """The retrieval API should return chunk, doc, and section results with lexical support."""
         with patch("DemoIndex.retrieval.DashScopeEmbeddingClient", _FakeEmbeddingClient):
             result = retrieve_candidates(
-                "2025年游戏应用洞察报告",
+                "2024 全球手游 CPI 和留存趋势",
                 top_k_dense=10,
                 top_k_lexical=10,
                 top_k_fused_chunks=12,
@@ -68,6 +67,8 @@ class RetrievalIntegrationTests(unittest.TestCase):
         self.assertTrue(payload["doc_candidates"])
         self.assertTrue(payload["section_candidates"])
         self.assertIn("summary", payload["section_candidates"][0])
+        self.assertGreater(payload["metadata"]["counts"]["lexical_hits"], 0)
+        self.assertTrue(any(item["lexical_rank"] is not None for item in payload["chunk_hits"]))
 
     def test_retrieve_cli_prints_json(self) -> None:
         """The retrieve CLI should print structured JSON output."""
@@ -76,7 +77,7 @@ class RetrievalIntegrationTests(unittest.TestCase):
             "DemoIndex.run",
             "retrieve",
             "--query",
-            "2025年游戏应用洞察报告",
+            "混合休闲 合作伙伴",
             "--top-k-dense",
             "8",
             "--top-k-lexical",
@@ -100,6 +101,7 @@ class RetrievalIntegrationTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["doc_candidates"])
+        self.assertGreater(payload["metadata"]["counts"]["lexical_hits"], 0)
 
 
 if __name__ == "__main__":

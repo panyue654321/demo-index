@@ -90,19 +90,27 @@ Recommended fields:
 Extract:
 
 - topic
-- metrics such as CPI, ROAS, retention, ARPU, IAP, IAA
 - time scope
-- region
-- platform
-- genre
 - intent type such as trend, benchmark, diagnosis, strategy, comparison
+
+Implementation note:
+
+- Stage 1 should stay generic in core code
+- domain-specific fields such as metrics, region, platform, and genre should only be filled by an optional external retrieval profile or by one fallback LLM parse when the query is genuinely sparse
+- already-informative Chinese queries should usually skip query-time LLM enrichment
 
 ### Stage 2: Global Candidate Recall
 
 Run:
 
 - dense chunk ANN retrieval
-- optional lexical retrieval over chunk text and titles
+- lexical retrieval over `title`, `title_path`, and `search_text`
+
+Implementation note:
+
+- lexical recall should stay PostgreSQL-native
+- Chinese-heavy queries should use generic derived search terms plus weighted title/title-path/body hits
+- `pg_trgm` should be used as a soft scoring signal, not as a strict whole-query gate
 
 The goal of this stage is not to answer directly.
 It is only to find:

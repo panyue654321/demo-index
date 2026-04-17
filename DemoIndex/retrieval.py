@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,67 +30,7 @@ DEFAULT_TOP_K_CHUNKS_PER_SECTION = 2
 DEFAULT_DOC_SCORE_CHUNK_LIMIT = 5
 DEFAULT_SECTION_SCORE_CHUNK_LIMIT = 3
 DEFAULT_RRF_K = 60
-
-METRIC_ALIASES = {
-    "CPI": ["cpi", "cost per install", "单次安装成本", "每次安装成本", "获客成本"],
-    "ROAS": ["roas"],
-    "ARPU": ["arpu", "每用户平均收入"],
-    "ARPMAU": ["arpamau", "arpmau"],
-    "Retention": ["retention", "留存", "d1", "d7", "d30"],
-    "IAA": ["iaa", "广告变现", "in-app advertising"],
-    "IAP": ["iap", "内购", "应用内购买", "in-app purchase"],
-    "CTR": ["ctr", "点击率"],
-    "CPM": ["cpm"],
-    "LTV": ["ltv"],
-    "DAU": ["dau"],
-    "MAU": ["mau"],
-}
-
-REGION_ALIASES = {
-    "Global": ["global", "全球"],
-    "North America": ["north america", "北美"],
-    "Europe": ["europe", "欧洲"],
-    "LATAM": ["latam", "latin america", "拉美", "拉丁美洲"],
-    "MENA": ["mena", "middle east", "north africa", "中东", "中东北非"],
-    "APAC": ["apac", "asia pacific", "亚太"],
-    "China": ["china", "中国"],
-    "United States": ["united states", "usa", "u.s.", "美国"],
-    "Japan": ["japan", "日本"],
-    "South Korea": ["south korea", "韩国"],
-    "United Kingdom": ["united kingdom", "uk", "英国"],
-    "Germany": ["germany", "德国"],
-    "France": ["france", "法国"],
-    "India": ["india", "印度"],
-    "Brazil": ["brazil", "巴西"],
-}
-
-PLATFORM_ALIASES = {
-    "iOS": ["ios", "iphone", "ipad"],
-    "Android": ["android"],
-    "Mobile": ["mobile", "mobile game", "mobile games", "手游", "移动游戏"],
-    "PC": ["pc", "desktop"],
-    "Console": ["console", "主机"],
-    "Steam": ["steam"],
-    "App Store": ["app store"],
-    "Google Play": ["google play"],
-}
-
-GENRE_ALIASES = {
-    "RPG": ["rpg", "角色扮演"],
-    "Strategy": ["strategy", "策略"],
-    "Action": ["action", "动作"],
-    "Casual": ["casual", "休闲"],
-    "Hybrid Casual": ["hybrid casual", "混合休闲"],
-    "Hyper Casual": ["hyper casual", "超休闲"],
-    "Casino": ["casino", "博彩"],
-    "Racing": ["racing", "竞速", "赛车"],
-    "Sports": ["sports", "体育"],
-    "Arcade": ["arcade", "街机"],
-    "Puzzle": ["puzzle", "解谜"],
-    "Simulation": ["simulation", "模拟"],
-    "Shooter": ["shooter", "射击"],
-    "Card": ["card", "卡牌"],
-}
+DEFAULT_PROFILE_ENV_VAR = "DEMOINDEX_RETRIEVAL_PROFILE_PATH"
 
 INTENT_PATTERNS = {
     "trend": ["trend", "trends", "趋势", "变化", "走势"],
@@ -105,15 +46,42 @@ STOP_TERMS = {
     "for",
     "with",
     "from",
+    "into",
+    "that",
+    "this",
+    "what",
+    "which",
+    "when",
+    "where",
+    "why",
+    "how",
     "关于",
+    "有关",
     "以及",
+    "还有",
+    "什么",
+    "哪个",
+    "哪些",
+    "如何",
+    "为什么",
+    "一下",
+    "看看",
+    "一下子",
+    "一个",
+    "一种",
+    "这个",
+    "那个",
     "趋势",
     "分析",
     "问题",
-    "游戏",
-    "手游",
-    "移动游戏",
+    "报告",
+    "研究",
 }
+
+LEADING_CJK_CONNECTOR_RE = re.compile(r"^[的和与及并就把将向对从在按为于]+")
+TRAILING_CJK_CONNECTOR_RE = re.compile(r"(的|和|与|及|并|等|方面|情况)+$")
+PROFILE_FIELD_NAMES = ("metrics", "regions", "platforms", "genres")
+LEXICAL_SCORE_THRESHOLD = 0.18
 
 
 @dataclass(frozen=True)
@@ -262,11 +230,11 @@ def retrieve_candidates(
         if debug_recorder is not None:
             debug_recorder.log_event("query_understanding", payload=query_understanding.to_dict())
 
-        lexical_future = None
+        lexical_candidate_count = 0
         with ThreadPoolExecutor(max_workers=2) as executor:
             lexical_future = executor.submit(
                 _run_lexical_recall,
-                query_understanding.normalized_query,
+                query_understanding,
                 top_k_lexical,
                 resolved_database_url,
                 debug_recorder,
@@ -283,7 +251,7 @@ def retrieve_candidates(
                     resolved_database_url,
                     embedding_client,
                 )
-            lexical_hits = lexical_future.result()
+            lexical_hits, lexical_candidate_count = lexical_future.result()
 
         with _debug_stage(debug_recorder, "fuse_chunk_hits"):
             fused_hits = _fuse_chunk_hits(
@@ -318,6 +286,7 @@ def retrieve_candidates(
                 "fused_chunk_hits": len(fused_hits),
                 "doc_candidates": len(doc_candidates),
                 "section_candidates": len(section_candidates),
+                "lexical_candidates": lexical_candidate_count,
             },
             "total_duration_ms": int((time.perf_counter() - started_at) * 1000),
             "debug_log_dir": str(debug_recorder.base_dir) if debug_recorder is not None else None,
@@ -345,20 +314,29 @@ def _parse_query_internal(
 ) -> QueryUnderstanding:
     """Parse a query with rule-first extraction and optional LLM enrichment."""
     normalized_query = _normalize_query(query)
+    profile_aliases = _load_retrieval_profile_aliases(debug_recorder=debug_recorder)
     rule_result = QueryUnderstanding(
         raw_query=query,
         normalized_query=normalized_query,
         language=_detect_language(normalized_query),
         intent=_detect_intent(normalized_query),
         terms=_extract_terms(normalized_query),
-        metrics=_match_aliases(normalized_query, METRIC_ALIASES),
-        regions=_match_aliases(normalized_query, REGION_ALIASES),
-        platforms=_match_aliases(normalized_query, PLATFORM_ALIASES),
-        genres=_match_aliases(normalized_query, GENRE_ALIASES),
+        metrics=_match_aliases(normalized_query, profile_aliases.get("metrics", {})),
+        regions=_match_aliases(normalized_query, profile_aliases.get("regions", {})),
+        platforms=_match_aliases(normalized_query, profile_aliases.get("platforms", {})),
+        genres=_match_aliases(normalized_query, profile_aliases.get("genres", {})),
         time_scope=_extract_time_scope(normalized_query),
         llm_enriched=False,
     )
-    if not use_llm or not _needs_llm_enrichment(rule_result):
+    if not use_llm:
+        if debug_recorder is not None:
+            debug_recorder.log_event("query_llm_enrichment_skipped", reason="llm_disabled")
+        return rule_result
+
+    enrichment_reason = _needs_llm_enrichment(rule_result)
+    if enrichment_reason is None:
+        if debug_recorder is not None:
+            debug_recorder.log_event("query_llm_enrichment_skipped", reason="generic_parse_sufficient")
         return rule_result
 
     try:
@@ -370,6 +348,7 @@ def _parse_query_internal(
                 "query_llm_enrichment_error",
                 error_type=type(exc).__name__,
                 error_message=str(exc),
+                reason=enrichment_reason,
             )
         return rule_result
 
@@ -388,7 +367,7 @@ def _enrich_query_with_llm(
         debug_recorder=debug_recorder,
     )
     prompt = f"""
-You are given a search query for a game-industry research retrieval system.
+You are given a search query for a research report retrieval system.
 Return only JSON with these keys:
 - language: string
 - intent: one of ["trend", "benchmark", "diagnosis", "strategy", "comparison", "general"]
@@ -409,16 +388,20 @@ Current rule-based parse:
 """.strip()
     response = client.completion(DEFAULT_PARSE_MODEL, prompt)
     payload = _extract_json_payload(response)
+    profile_aliases = _load_retrieval_profile_aliases(debug_recorder=None)
     return QueryUnderstanding(
         raw_query=query_understanding.raw_query,
         normalized_query=query_understanding.normalized_query,
         language=str(payload.get("language") or query_understanding.language),
         intent=str(payload.get("intent") or query_understanding.intent),
         terms=_normalize_string_list(payload.get("terms")),
-        metrics=_canonicalize_values(_normalize_string_list(payload.get("metrics")), METRIC_ALIASES),
-        regions=_canonicalize_values(_normalize_string_list(payload.get("regions")), REGION_ALIASES),
-        platforms=_canonicalize_values(_normalize_string_list(payload.get("platforms")), PLATFORM_ALIASES),
-        genres=_canonicalize_values(_normalize_string_list(payload.get("genres")), GENRE_ALIASES),
+        metrics=_canonicalize_values(_normalize_string_list(payload.get("metrics")), profile_aliases.get("metrics", {})),
+        regions=_canonicalize_values(_normalize_string_list(payload.get("regions")), profile_aliases.get("regions", {})),
+        platforms=_canonicalize_values(
+            _normalize_string_list(payload.get("platforms")),
+            profile_aliases.get("platforms", {}),
+        ),
+        genres=_canonicalize_values(_normalize_string_list(payload.get("genres")), profile_aliases.get("genres", {})),
         time_scope=_normalize_time_scope(payload.get("time_scope")),
         llm_enriched=True,
     )
@@ -496,40 +479,134 @@ def _run_dense_recall(
 
 
 def _run_lexical_recall(
-    normalized_query: str,
+    query_understanding: QueryUnderstanding,
     top_k_lexical: int,
     database_url: str,
     debug_recorder: DebugRecorder | None,
-) -> list[dict[str, Any]]:
-    """Run lexical recall over section chunks using pg_trgm."""
+) -> tuple[list[dict[str, Any]], int]:
+    """Run lexical recall over section chunks using generic Chinese-friendly matching."""
+    search_terms = _derive_search_terms(query_understanding)
+    lowered_terms = [term.casefold() for term in search_terms]
+    if debug_recorder is not None:
+        debug_recorder.log_event(
+            "lexical_search_terms",
+            normalized_query=query_understanding.normalized_query,
+            search_terms=search_terms,
+        )
+
     with _debug_stage(debug_recorder, "lexical_recall"):
         psycopg, dict_row = _import_psycopg()
         with psycopg.connect(database_url, row_factory=dict_row) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    WITH scored AS (
+                        SELECT
+                            chunk_id::text AS chunk_id,
+                            doc_id,
+                            section_id::text AS section_id,
+                            node_id,
+                            title,
+                            title_path,
+                            page_index,
+                            chunk_index,
+                            chunk_text,
+                            (
+                                SELECT COUNT(*)
+                                FROM unnest(%s::text[]) AS term
+                                WHERE char_length(term) >= 2
+                                  AND lower(title) LIKE '%%' || term || '%%'
+                            ) AS title_term_hits,
+                            (
+                                SELECT COUNT(*)
+                                FROM unnest(%s::text[]) AS term
+                                WHERE char_length(term) >= 2
+                                  AND lower(title_path) LIKE '%%' || term || '%%'
+                            ) AS title_path_term_hits,
+                            (
+                                SELECT COUNT(*)
+                                FROM unnest(%s::text[]) AS term
+                                WHERE char_length(term) >= 2
+                                  AND lower(search_text) LIKE '%%' || term || '%%'
+                            ) AS search_text_term_hits,
+                            word_similarity(lower(title), %s) AS title_word_similarity,
+                            word_similarity(lower(title_path), %s) AS title_path_word_similarity,
+                            word_similarity(lower(search_text), %s) AS search_text_word_similarity,
+                            similarity(lower(title), %s) AS title_similarity,
+                            similarity(lower(title_path), %s) AS title_path_similarity,
+                            similarity(lower(search_text), %s) AS search_text_similarity
+                        FROM section_chunks
+                    ),
+                    filtered AS (
+                        SELECT
+                            *,
+                            (
+                                title_term_hits * 5.0 +
+                                title_path_term_hits * 3.0 +
+                                search_text_term_hits * 1.5 +
+                                title_word_similarity * 2.0 +
+                                title_path_word_similarity * 1.25 +
+                                search_text_word_similarity * 1.0 +
+                                title_similarity * 1.0 +
+                                title_path_similarity * 0.75 +
+                                search_text_similarity * 0.5
+                            ) AS lexical_score
+                        FROM scored
+                        WHERE
+                            title_term_hits > 0
+                            OR title_path_term_hits > 0
+                            OR search_text_term_hits > 0
+                            OR GREATEST(
+                                title_word_similarity,
+                                title_path_word_similarity,
+                                search_text_word_similarity,
+                                title_similarity,
+                                title_path_similarity,
+                                search_text_similarity
+                            ) >= %s
+                    )
                     SELECT
-                        chunk_id::text AS chunk_id,
+                        chunk_id,
                         doc_id,
-                        section_id::text AS section_id,
+                        section_id,
                         node_id,
                         title,
                         title_path,
                         page_index,
                         chunk_index,
                         chunk_text,
-                        similarity(lower(search_text), lower(%s)) AS lexical_score
-                    FROM section_chunks
-                    WHERE lower(search_text) %% lower(%s)
+                        lexical_score,
+                        COUNT(*) OVER () AS candidate_count
+                    FROM filtered
                     ORDER BY lexical_score DESC, doc_id, chunk_id
                     LIMIT %s
                     """,
-                    (normalized_query, normalized_query, int(top_k_lexical)),
+                    (
+                        lowered_terms,
+                        lowered_terms,
+                        lowered_terms,
+                        query_understanding.normalized_query.casefold(),
+                        query_understanding.normalized_query.casefold(),
+                        query_understanding.normalized_query.casefold(),
+                        query_understanding.normalized_query.casefold(),
+                        query_understanding.normalized_query.casefold(),
+                        query_understanding.normalized_query.casefold(),
+                        LEXICAL_SCORE_THRESHOLD,
+                        int(top_k_lexical),
+                    ),
                 )
                 rows = list(cursor.fetchall())
+        candidate_count = int(rows[0]["candidate_count"]) if rows else 0
         for rank, row in enumerate(rows, start=1):
             row["lexical_rank"] = rank
-        return rows
+            row.pop("candidate_count", None)
+        if debug_recorder is not None:
+            debug_recorder.log_event(
+                "lexical_recall_stats",
+                candidate_count=candidate_count,
+                lexical_hit_count=len(rows),
+            )
+        return rows, candidate_count
 
 
 def _fuse_chunk_hits(
@@ -694,6 +771,49 @@ def _create_debug_recorder(*, debug_log: bool, debug_log_dir: str | None) -> Deb
     return DebugRecorder(REPO_ROOT / "DemoIndex" / "artifacts" / "retrieval" / timestamp / "debug")
 
 
+def _load_retrieval_profile_aliases(*, debug_recorder: DebugRecorder | None) -> dict[str, dict[str, list[str]]]:
+    """Load optional external alias mappings for query understanding."""
+    profile_path = os.getenv(DEFAULT_PROFILE_ENV_VAR)
+    if not profile_path:
+        if debug_recorder is not None:
+            debug_recorder.log_event("retrieval_profile_loaded", enabled=False, path=None)
+        return {field_name: {} for field_name in PROFILE_FIELD_NAMES}
+
+    resolved_path = Path(profile_path).expanduser().resolve()
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Retrieval profile must be a JSON object: {resolved_path}")
+
+    alias_maps = {
+        field_name: _normalize_profile_alias_mapping(payload.get(field_name))
+        for field_name in PROFILE_FIELD_NAMES
+    }
+    if debug_recorder is not None:
+        debug_recorder.log_event(
+            "retrieval_profile_loaded",
+            enabled=True,
+            path=str(resolved_path),
+            available_fields=[field_name for field_name, values in alias_maps.items() if values],
+        )
+    return alias_maps
+
+
+def _normalize_profile_alias_mapping(value: Any) -> dict[str, list[str]]:
+    """Normalize one alias mapping payload from the optional retrieval profile."""
+    if not isinstance(value, dict):
+        return {}
+    results: dict[str, list[str]] = {}
+    for canonical, aliases in value.items():
+        canonical_text = str(canonical).strip()
+        if not canonical_text:
+            continue
+        normalized_aliases = _normalize_string_list(aliases)
+        if canonical_text not in normalized_aliases:
+            normalized_aliases.insert(0, canonical_text)
+        results[canonical_text] = normalized_aliases
+    return results
+
+
 def _debug_stage(debug_recorder: DebugRecorder | None, stage_name: str):
     """Return a no-op or structured debug stage context manager."""
     if debug_recorder is None:
@@ -733,13 +853,9 @@ def _extract_terms(query: str) -> list[str]:
     candidates = re.findall(r"[A-Za-z0-9\+\-\.]{2,}|[\u4e00-\u9fff]{2,}", query)
     results: list[str] = []
     for token in candidates:
-        normalized = token.strip()
-        if not normalized:
-            continue
-        if normalized.casefold() in STOP_TERMS:
-            continue
-        if normalized not in results:
-            results.append(normalized)
+        for normalized in _expand_term_candidates(token):
+            if normalized not in results:
+                results.append(normalized)
     return results
 
 
@@ -806,20 +922,18 @@ def _alias_matches_query(query: str, alias: str) -> bool:
     return alias in query
 
 
-def _needs_llm_enrichment(query_understanding: QueryUnderstanding) -> bool:
-    """Return whether the rule-based parse is sparse enough to justify one LLM pass."""
+def _needs_llm_enrichment(query_understanding: QueryUnderstanding) -> str | None:
+    """Return an enrichment reason when one LLM pass is justified."""
     sparse_time = not query_understanding.time_scope.get("years") and not query_understanding.time_scope.get("quarters")
-    return any(
-        [
-            len(query_understanding.terms) < 2,
-            not query_understanding.metrics,
-            not query_understanding.regions,
-            not query_understanding.platforms,
-            not query_understanding.genres,
-            sparse_time,
-            query_understanding.intent == "general",
-        ]
-    )
+    if query_understanding.language == "unknown":
+        return "unknown_language"
+    if len(query_understanding.normalized_query) <= 4:
+        return "very_short_query"
+    if len(query_understanding.terms) < 2 and sparse_time:
+        return "insufficient_terms_and_time_scope"
+    if query_understanding.intent == "general" and len(query_understanding.terms) < 3 and sparse_time:
+        return "generic_intent_with_sparse_terms"
+    return None
 
 
 def _canonicalize_values(values: list[str], alias_mapping: dict[str, list[str]]) -> list[str]:
@@ -836,6 +950,60 @@ def _canonicalize_values(values: list[str], alias_mapping: dict[str, list[str]])
         canonical = alias_lookup.get(str(value).casefold(), str(value))
         if canonical not in results:
             results.append(canonical)
+    return results
+
+
+def _expand_term_candidates(token: str) -> list[str]:
+    """Expand one raw regex token into generic searchable terms."""
+    normalized = str(token).strip()
+    if not normalized:
+        return []
+    if " " in normalized or (
+        re.search(r"[A-Za-z0-9]", normalized) and re.search(r"[\u4e00-\u9fff]", normalized)
+    ):
+        results: list[str] = []
+        for part in re.findall(r"[A-Za-z0-9\+\-\.]{2,}|[\u4e00-\u9fff]{2,}", normalized):
+            for expanded in _expand_term_candidates(part):
+                if expanded not in results:
+                    results.append(expanded)
+        return results
+    if re.fullmatch(r"[A-Za-z0-9\+\-\.]{2,}", normalized):
+        lowered = normalized.casefold()
+        if lowered in STOP_TERMS:
+            return []
+        return [normalized]
+
+    cleaned = LEADING_CJK_CONNECTOR_RE.sub("", normalized)
+    cleaned = TRAILING_CJK_CONNECTOR_RE.sub("", cleaned)
+    if len(cleaned) < 2:
+        return []
+
+    results = [cleaned]
+    if len(cleaned) >= 3:
+        prefix = cleaned[:2]
+        suffix = cleaned[-2:]
+        if prefix not in results:
+            results.append(prefix)
+        if suffix not in results:
+            results.append(suffix)
+    return [item for item in results if item.casefold() not in STOP_TERMS]
+
+
+def _derive_search_terms(query_understanding: QueryUnderstanding) -> list[str]:
+    """Derive generic lexical search terms from one parsed query."""
+    results: list[str] = []
+    raw_candidates: list[str] = [query_understanding.normalized_query, *query_understanding.terms]
+    raw_candidates.extend(str(year) for year in query_understanding.time_scope.get("years", []))
+    raw_candidates.extend(query_understanding.time_scope.get("quarters", []))
+
+    for candidate in raw_candidates:
+        for token in _expand_term_candidates(candidate):
+            normalized = token.casefold() if re.search(r"[A-Za-z]", token) else token
+            if len(normalized) < 2:
+                continue
+            if normalized in results:
+                continue
+            results.append(normalized)
     return results
 
 

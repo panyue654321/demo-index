@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +12,7 @@ from DemoIndex.retrieval import (
     QueryUnderstanding,
     RetrievalChunkHit,
     _aggregate_candidates,
+    _derive_search_terms,
     _fuse_chunk_hits,
     parse_query,
 )
@@ -18,24 +22,54 @@ class RetrievalUnitTests(unittest.TestCase):
     """Cover rule parsing, LLM fallback, fusion, and aggregation helpers."""
 
     def test_parse_query_rule_based_mixed_language(self) -> None:
-        """Rule parsing should extract common mixed Chinese and English fields."""
+        """Generic parsing should extract language, intent, terms, and time scope."""
         result = parse_query("2024 全球手游 CPI 和 retention 趋势", use_llm=False)
         self.assertEqual(result.language, "mixed")
         self.assertEqual(result.intent, "trend")
-        self.assertIn("CPI", result.metrics)
-        self.assertIn("Retention", result.metrics)
-        self.assertIn("Global", result.regions)
+        self.assertIn("全球手游", result.terms)
+        self.assertIn("CPI", result.terms)
         self.assertIn(2024, result.time_scope["years"])
+        self.assertEqual(result.metrics, [])
+        self.assertEqual(result.regions, [])
         self.assertFalse(result.llm_enriched)
 
     def test_parse_query_llm_failure_falls_back(self) -> None:
         """LLM enrichment errors should not break the rule-based parse."""
         with patch("DemoIndex.retrieval._enrich_query_with_llm", side_effect=RuntimeError("boom")):
-            result = parse_query("欧美 RPG ARPU 对比", use_llm=True)
-        self.assertIn("ARPU", result.metrics)
-        self.assertIn("RPG", result.genres)
-        self.assertEqual(result.intent, "comparison")
+            result = parse_query("留存率", use_llm=True)
+        self.assertEqual(result.intent, "general")
+        self.assertEqual(result.terms, ["留存率", "留存", "存率"])
+        self.assertEqual(result.metrics, [])
+        self.assertEqual(result.genres, [])
         self.assertFalse(result.llm_enriched)
+
+    def test_parse_query_can_use_external_profile_aliases(self) -> None:
+        """Optional external retrieval profiles should populate domain fields."""
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+            json.dump(
+                {
+                    "metrics": {"Retention": ["留存", "留存率"]},
+                    "platforms": {"Mobile": ["手游"]},
+                },
+                handle,
+                ensure_ascii=False,
+            )
+            profile_path = handle.name
+        try:
+            with patch.dict(os.environ, {"DEMOINDEX_RETRIEVAL_PROFILE_PATH": profile_path}, clear=False):
+                result = parse_query("手游留存率", use_llm=False)
+            self.assertIn("Retention", result.metrics)
+            self.assertIn("Mobile", result.platforms)
+        finally:
+            os.unlink(profile_path)
+
+    def test_parse_query_skips_llm_for_informative_query(self) -> None:
+        """Informative generic queries should not trigger query-time LLM enrichment."""
+        with patch("DemoIndex.retrieval._enrich_query_with_llm") as mock_enrich:
+            result = parse_query("2024 全球手游 CPI 和留存趋势", use_llm=True)
+        mock_enrich.assert_not_called()
+        self.assertFalse(result.llm_enriched)
+        self.assertIn(2024, result.time_scope["years"])
 
     def test_rrf_fusion_merges_dense_and_lexical_hits(self) -> None:
         """RRF fusion should preserve both branches and reward overlap."""
@@ -100,6 +134,28 @@ class RetrievalUnitTests(unittest.TestCase):
         self.assertIsNotNone(fused[0].dense_rank)
         self.assertIsNotNone(fused[0].lexical_rank)
         self.assertEqual({item.chunk_id for item in fused}, {"c1", "c2", "c3"})
+
+    def test_derive_search_terms_keeps_chinese_subterms(self) -> None:
+        """Lexical search terms should retain useful Chinese fragments and ASCII tokens."""
+        understanding = QueryUnderstanding(
+            raw_query="2024 全球手游 CPI 和留存趋势",
+            normalized_query="2024 全球手游 CPI 和留存趋势",
+            language="mixed",
+            intent="trend",
+            terms=["全球手游", "CPI", "留存趋势"],
+            metrics=[],
+            regions=[],
+            platforms=[],
+            genres=[],
+            time_scope={"years": [2024], "quarters": [], "raw_mentions": ["2024"]},
+            llm_enriched=False,
+        )
+        search_terms = _derive_search_terms(understanding)
+        self.assertIn("2024", search_terms)
+        self.assertIn("cpi", search_terms)
+        self.assertIn("全球", search_terms)
+        self.assertIn("手游", search_terms)
+        self.assertIn("留存", search_terms)
 
     def test_doc_and_section_aggregation_limits(self) -> None:
         """Aggregation should limit sections and supporting chunks per doc."""

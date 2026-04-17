@@ -370,6 +370,14 @@ def _ensure_chunk_schema(cursor) -> None:
         f"CREATE INDEX IF NOT EXISTS idx_{CHUNK_TABLE_NAME}_search_text_trgm "
         f"ON {CHUNK_TABLE_NAME} USING gin (lower(search_text) gin_trgm_ops)"
     )
+    cursor.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{CHUNK_TABLE_NAME}_title_trgm "
+        f"ON {CHUNK_TABLE_NAME} USING gin (lower(title) gin_trgm_ops)"
+    )
+    cursor.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{CHUNK_TABLE_NAME}_title_path_trgm "
+        f"ON {CHUNK_TABLE_NAME} USING gin (lower(title_path) gin_trgm_ops)"
+    )
 
 
 def _coerce_page_index(value: Any) -> int | None:
