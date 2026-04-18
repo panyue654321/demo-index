@@ -56,8 +56,9 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and compare DemoIndex trees.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="Build a PageIndex-style tree from a PDF.")
-    run_parser.add_argument("--pdf-path", required=True, help="Path to the PDF file.")
+    run_parser = subparsers.add_parser("run", help="Build a PageIndex-style tree from a PDF or Markdown file.")
+    run_parser.add_argument("--input-path", default=None, help="Path to the input PDF or Markdown file.")
+    run_parser.add_argument("--pdf-path", default=None, help="Deprecated alias for PDF input path.")
     run_parser.add_argument("--output-json", default=None, help="Optional output JSON path.")
     run_parser.add_argument(
         "--artifacts-dir",
@@ -93,6 +94,12 @@ def _parse_args() -> argparse.Namespace:
         "--global-index-model",
         default="text-embedding-v4",
         help="DashScope embedding model used for global chunk indexing.",
+    )
+    run_parser.add_argument(
+        "--markdown-layout",
+        choices=("auto", "h1_forest", "page_per_page"),
+        default="auto",
+        help="Markdown layout mode. `auto` chooses page_per_page when <!-- page:N --> comments exist.",
     )
     run_parser.add_argument(
         "--debug-log",
@@ -539,21 +546,33 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_run_input_path(args: argparse.Namespace) -> Path:
+    """Resolve the effective build input path for the `run` subcommand."""
+    if args.input_path and args.pdf_path:
+        raise ValueError("Only one of --input-path or --pdf-path may be provided.")
+    selected = args.input_path or args.pdf_path
+    if not selected:
+        raise ValueError("The run command requires --input-path or --pdf-path.")
+    return Path(selected).expanduser().resolve()
+
+
 def main() -> int:
     """Run the DemoIndex CLI."""
     args = _parse_args()
     if args.command == "run":
+        input_path = _resolve_run_input_path(args)
         artifact_root = (
             Path(args.artifacts_dir).expanduser().resolve()
             if args.artifacts_dir
-            else REPO_ROOT / "DemoIndex" / "artifacts" / Path(args.pdf_path).stem
+            else REPO_ROOT / "DemoIndex" / "artifacts" / input_path.stem
         )
         output_path = (
             Path(args.output_json).expanduser().resolve()
             if args.output_json
-            else artifact_root / f"{Path(args.pdf_path).stem}_pageindex_tree.json"
+            else artifact_root / f"{input_path.stem}_pageindex_tree.json"
         )
         result = build_pageindex_tree(
+            input_path=str(input_path),
             pdf_path=args.pdf_path,
             output_json=args.output_json,
             artifacts_dir=args.artifacts_dir,
@@ -563,6 +582,7 @@ def main() -> int:
             write_postgres=args.write_postgres,
             write_global_index=args.write_global_index,
             global_index_model=args.global_index_model,
+            markdown_layout=args.markdown_layout,
             debug_log=args.debug_log,
             debug_log_dir=args.debug_log_dir,
         )

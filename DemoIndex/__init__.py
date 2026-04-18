@@ -1,4 +1,4 @@
-"""DemoIndex package for PDF-to-markdown PageIndex-style trees."""
+"""DemoIndex package for PDF and Markdown PageIndex-style trees."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Any
 
 
 def build_pageindex_tree(*args: Any, **kwargs: Any) -> dict:
-    """Build a PageIndex-style tree from a PDF."""
+    """Build a PageIndex-style tree from a PDF or Markdown input."""
     from .pipeline import build_pageindex_tree as _build_pageindex_tree
 
     return _build_pageindex_tree(*args, **kwargs)

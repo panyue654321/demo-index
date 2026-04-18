@@ -12,6 +12,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from .build_md_pageindex import PageIndexOptions, sync_build_pageindex_payload
 from .debug import DebugRecorder
 from .env import PAGEINDEX_ROOT, REPO_ROOT, ensure_pageindex_import_path
 from .global_index import (
@@ -24,7 +25,8 @@ from .postgres_store import persist_document_sections, persist_section_chunks, r
 
 
 def build_pageindex_tree(
-    pdf_path: str,
+    input_path: str | None = None,
+    pdf_path: str | None = None,
     output_json: str | None = None,
     artifacts_dir: str | None = None,
     model: str = "dashscope/qwen3.6-plus",
@@ -33,10 +35,11 @@ def build_pageindex_tree(
     write_postgres: bool = False,
     write_global_index: bool = False,
     global_index_model: str = DEFAULT_GLOBAL_INDEX_MODEL,
+    markdown_layout: str = "auto",
     debug_log: bool = False,
     debug_log_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Build a target-format tree by reusing PageIndex's PDF processing flow."""
+    """Build a target-format tree from one PDF or Markdown input."""
     ensure_pageindex_import_path()
     _load_pageindex_env()
     effective_write_postgres = write_postgres or write_global_index
@@ -44,14 +47,13 @@ def build_pageindex_tree(
     if effective_write_postgres:
         resolve_database_url()
 
-    resolved_pdf_path = Path(pdf_path).expanduser().resolve()
-    if not resolved_pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {resolved_pdf_path}")
+    resolved_input_path = _resolve_input_path(input_path=input_path, pdf_path=pdf_path)
+    input_kind = _detect_input_kind(resolved_input_path)
 
     artifact_root = (
         Path(artifacts_dir).expanduser().resolve()
         if artifacts_dir
-        else REPO_ROOT / "DemoIndex" / "artifacts" / resolved_pdf_path.stem
+        else REPO_ROOT / "DemoIndex" / "artifacts" / resolved_input_path.stem
     )
     artifact_root.mkdir(parents=True, exist_ok=True)
     debug_recorder = (
@@ -61,7 +63,8 @@ def build_pageindex_tree(
     )
     if debug_recorder is not None:
         debug_recorder.set_run_metadata(
-            pdf_path=str(resolved_pdf_path),
+            input_path=str(resolved_input_path),
+            input_kind=input_kind,
             artifact_root=str(artifact_root),
             output_json=str(Path(output_json).expanduser().resolve()) if output_json else None,
             model=model,
@@ -70,82 +73,37 @@ def build_pageindex_tree(
             write_postgres=effective_write_postgres,
             write_global_index=write_global_index,
             global_index_model=global_index_model,
+            markdown_layout=markdown_layout,
         )
-    pageindex_module, utils_module, config_loader = _patch_pageindex_llm(
-        model=model,
-        fallback_model=fallback_model,
-        debug_recorder=debug_recorder,
-    )
 
     target_output_path: Path | None = None
 
     try:
-        with _debug_stage(debug_recorder, "load_pageindex_config"):
-            opt = config_loader.load(
-                {
-                    "model": model,
-                    "if_add_node_id": "yes",
-                    "if_add_node_summary": "yes" if effective_include_summary else "no",
-                    "if_add_doc_description": "no",
-                    "if_add_node_text": "yes",
-                }
+        if input_kind == "pdf":
+            output = _build_pdf_output(
+                resolved_input_path=resolved_input_path,
+                artifact_root=artifact_root,
+                model=model,
+                fallback_model=fallback_model,
+                include_summary=effective_include_summary,
+                debug_recorder=debug_recorder,
             )
-        with _debug_stage(debug_recorder, "get_page_tokens"):
-            page_list = utils_module.get_page_tokens(str(resolved_pdf_path), model=model)
-        with _debug_stage(debug_recorder, "extract_page_artifacts"):
-            page_artifacts = extract_page_artifacts(resolved_pdf_path, artifact_root)
-        with _debug_stage(debug_recorder, "extract_outline_entries"):
-            toc_page_number, outline_entries = extract_outline_entries(page_artifacts)
-        _save_json(artifact_root / "outline_entries.json", [asdict(entry) for entry in outline_entries])
-
-        with _debug_stage(debug_recorder, "build_seeded_outline"):
-            seeded_outline = _build_seeded_outline(
-                page_artifacts=page_artifacts,
-                outline_entries=outline_entries,
-                toc_page_number=toc_page_number,
+        else:
+            output = _build_markdown_output(
+                resolved_input_path=resolved_input_path,
+                artifact_root=artifact_root,
+                model=model,
+                fallback_model=fallback_model,
+                include_summary=effective_include_summary,
+                markdown_layout=markdown_layout,
+                debug_recorder=debug_recorder,
             )
-        _save_json(artifact_root / "seeded_outline.json", seeded_outline)
-
-        with _debug_stage(debug_recorder, "build_tree_from_seeded_outline"):
-            tree = asyncio.run(
-                _build_tree_from_seeded_outline(
-                    seeded_outline=seeded_outline,
-                    page_list=page_list,
-                    pageindex_module=pageindex_module,
-                    utils_module=utils_module,
-                    opt=opt,
-                    debug_recorder=debug_recorder,
-                )
-            )
-        with _debug_stage(debug_recorder, "write_node_id"):
-            utils_module.write_node_id(tree)
-        with _debug_stage(debug_recorder, "add_node_text"):
-            utils_module.add_node_text(tree, page_list)
-        if effective_include_summary:
-            with _debug_stage(debug_recorder, "generate_node_summaries"):
-                asyncio.run(utils_module.generate_summaries_for_structure(tree, model=opt.model))
-
-        raw_result = {
-            "doc_name": resolved_pdf_path.name,
-            "structure": tree,
-        }
-        _save_json(artifact_root / "pageindex_raw.json", raw_result)
-
-        with _debug_stage(debug_recorder, "convert_output_tree"):
-            output = {
-                "doc_id": _stable_doc_id(resolved_pdf_path),
-                "status": "completed",
-                "retrieval_ready": False,
-                "result": _convert_pageindex_structure(
-                    raw_result.get("structure") or [],
-                    include_summary=effective_include_summary,
-                ),
-            }
         if effective_write_postgres:
             with _debug_stage(debug_recorder, "persist_document_sections"):
                 persistence_report = persist_document_sections(output)
             _save_json(artifact_root / "postgres_write.json", persistence_report)
         if write_global_index:
+            utils_module = _load_pageindex_utils()
             with _debug_stage(debug_recorder, "build_global_chunk_records"):
                 embedding_client = DashScopeEmbeddingClient(
                     model_name=global_index_model,
@@ -176,7 +134,7 @@ def build_pageindex_tree(
         target_output_path = (
             Path(output_json).expanduser().resolve()
             if output_json
-            else artifact_root / f"{resolved_pdf_path.stem}_pageindex_tree.json"
+            else artifact_root / f"{resolved_input_path.stem}_pageindex_tree.json"
         )
         with _debug_stage(debug_recorder, "save_final_output"):
             _save_json(target_output_path, output)
@@ -197,6 +155,157 @@ def build_pageindex_tree(
                 outline_entries_path=str(artifact_root / "outline_entries.json"),
                 seeded_outline_path=str(artifact_root / "seeded_outline.json"),
             )
+
+
+def _build_pdf_output(
+    *,
+    resolved_input_path: Path,
+    artifact_root: Path,
+    model: str,
+    fallback_model: str | None,
+    include_summary: bool,
+    debug_recorder: DebugRecorder | None,
+) -> dict[str, Any]:
+    """Build the final output payload for one PDF input."""
+    pageindex_module, utils_module, config_loader = _patch_pageindex_llm(
+        model=model,
+        fallback_model=fallback_model,
+        debug_recorder=debug_recorder,
+    )
+    with _debug_stage(debug_recorder, "load_pageindex_config"):
+        opt = config_loader.load(
+            {
+                "model": model,
+                "if_add_node_id": "yes",
+                "if_add_node_summary": "yes" if include_summary else "no",
+                "if_add_doc_description": "no",
+                "if_add_node_text": "yes",
+            }
+        )
+    with _debug_stage(debug_recorder, "get_page_tokens"):
+        page_list = utils_module.get_page_tokens(str(resolved_input_path), model=model)
+    with _debug_stage(debug_recorder, "extract_page_artifacts"):
+        page_artifacts = extract_page_artifacts(resolved_input_path, artifact_root)
+    with _debug_stage(debug_recorder, "extract_outline_entries"):
+        toc_page_number, outline_entries = extract_outline_entries(page_artifacts)
+    _save_json(artifact_root / "outline_entries.json", [asdict(entry) for entry in outline_entries])
+
+    with _debug_stage(debug_recorder, "build_seeded_outline"):
+        seeded_outline = _build_seeded_outline(
+            page_artifacts=page_artifacts,
+            outline_entries=outline_entries,
+            toc_page_number=toc_page_number,
+        )
+    _save_json(artifact_root / "seeded_outline.json", seeded_outline)
+
+    with _debug_stage(debug_recorder, "build_tree_from_seeded_outline"):
+        tree = asyncio.run(
+            _build_tree_from_seeded_outline(
+                seeded_outline=seeded_outline,
+                page_list=page_list,
+                pageindex_module=pageindex_module,
+                utils_module=utils_module,
+                opt=opt,
+                debug_recorder=debug_recorder,
+            )
+        )
+    with _debug_stage(debug_recorder, "write_node_id"):
+        utils_module.write_node_id(tree)
+    with _debug_stage(debug_recorder, "add_node_text"):
+        utils_module.add_node_text(tree, page_list)
+    if include_summary:
+        with _debug_stage(debug_recorder, "generate_node_summaries"):
+            asyncio.run(utils_module.generate_summaries_for_structure(tree, model=opt.model))
+
+    raw_result = {
+        "doc_name": resolved_input_path.name,
+        "structure": tree,
+    }
+    _save_json(artifact_root / "pageindex_raw.json", raw_result)
+
+    with _debug_stage(debug_recorder, "convert_output_tree"):
+        return {
+            "doc_id": _stable_doc_id(resolved_input_path),
+            "status": "completed",
+            "retrieval_ready": False,
+            "result": _convert_pageindex_structure(
+                raw_result.get("structure") or [],
+                include_summary=include_summary,
+            ),
+        }
+
+
+def _build_markdown_output(
+    *,
+    resolved_input_path: Path,
+    artifact_root: Path,
+    model: str,
+    fallback_model: str | None,
+    include_summary: bool,
+    markdown_layout: str,
+    debug_recorder: DebugRecorder | None,
+) -> dict[str, Any]:
+    """Build the final output payload for one Markdown input."""
+    resolved_layout = _resolve_markdown_layout(resolved_input_path, markdown_layout)
+    if debug_recorder is not None:
+        debug_recorder.log_event(
+            "markdown_layout_selected",
+            input_path=str(resolved_input_path),
+            requested_layout=markdown_layout,
+            resolved_layout=resolved_layout,
+        )
+    with _debug_stage(debug_recorder, "build_markdown_pageindex"):
+        payload = sync_build_pageindex_payload(
+            resolved_input_path,
+            PageIndexOptions(
+                doc_id=_stable_doc_id(resolved_input_path),
+                status="completed",
+                retrieval_ready=False,
+                if_add_summary=include_summary,
+                model=model,
+            ),
+            llm_factory=lambda: QwenChatClient(
+                primary_model=model,
+                fallback_model=fallback_model,
+                debug_recorder=debug_recorder,
+            ),
+            layout=resolved_layout,
+        )
+    _save_json(artifact_root / "pageindex_raw.json", payload)
+    return payload
+
+
+def _resolve_input_path(*, input_path: str | None, pdf_path: str | None) -> Path:
+    """Resolve the one allowed build input path and validate its existence."""
+    provided_paths = [value for value in (input_path, pdf_path) if value]
+    if not provided_paths:
+        raise ValueError("Either input_path or pdf_path must be provided.")
+    if input_path and pdf_path:
+        raise ValueError("Only one of input_path or pdf_path may be provided.")
+    resolved_path = Path(provided_paths[0]).expanduser().resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Input file not found: {resolved_path}")
+    return resolved_path
+
+
+def _detect_input_kind(input_path: Path) -> str:
+    """Return the normalized input kind for one build input path."""
+    suffix = input_path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".md", ".markdown"}:
+        return "markdown"
+    raise ValueError(f"Unsupported input extension for DemoIndex build: {input_path.suffix}")
+
+
+def _resolve_markdown_layout(input_path: Path, requested_layout: str) -> str:
+    """Resolve the effective Markdown layout for one Markdown input."""
+    if requested_layout != "auto":
+        return requested_layout
+    content = input_path.read_text(encoding="utf-8")
+    if "<!-- page:" in content:
+        return "page_per_page"
+    return "h1_forest"
 
 
 async def _build_tree_from_seeded_outline(
@@ -317,6 +426,13 @@ def _patch_pageindex_llm(
     pageindex_module.llm_completion = client.completion
     pageindex_module.llm_acompletion = client.acompletion
     return pageindex_module, utils_module, utils_module.ConfigLoader()
+
+
+def _load_pageindex_utils():
+    """Load the PageIndex utilities module for shared helpers such as token counting."""
+    import importlib
+
+    return importlib.import_module("pageindex.utils")
 
 
 def _build_seeded_outline(
