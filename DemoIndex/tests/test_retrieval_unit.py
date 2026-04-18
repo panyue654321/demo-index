@@ -9,19 +9,30 @@ import unittest
 from unittest.mock import patch
 
 from DemoIndex.retrieval import (
+    ContextChunk,
+    ContextSection,
     DocCandidate,
+    EvidenceItem,
+    ExpandedContext,
+    ExpandedDoc,
     LocalizedSection,
     QueryUnderstanding,
     RetrievalStage12Result,
     RetrievalChunkHit,
     SectionCandidate,
+    _Stage4ChunkRow,
+    _assemble_stage4_answer_context_text,
     _Stage3TreeSection,
     _aggregate_candidates,
     _build_stage3_candidate_pool,
+    _build_stage4_context_sections,
+    _build_evidence_items,
     _derive_search_terms,
     _fuse_chunk_hits,
+    _label_evidence_items_with_llm,
     _rerank_stage3_sections_with_llm,
     _score_stage3_candidates,
+    _select_stage4_evidence_chunks,
     localize_sections,
     parse_query,
 )
@@ -409,6 +420,232 @@ class RetrievalUnitTests(unittest.TestCase):
         self.assertTrue(result.localized_docs)
         self.assertEqual(result.localized_docs[0].mode_used, "heuristic")
         self.assertTrue(result.localized_sections)
+
+    def test_stage4_context_expansion_includes_tree_relations_and_neighbors(self) -> None:
+        """Stage 4 helpers should include ancestors, descendants, siblings, and neighboring chunks."""
+        focus = LocalizedSection(
+            doc_id="d1",
+            section_id="focus",
+            node_id="n1",
+            parent_id="root",
+            title="Focus",
+            depth=1,
+            summary="focus summary with query",
+            title_path="Root > Focus",
+            localization_score=5.0,
+            stage2_section_score=0.03,
+            anchor_section_id="focus",
+            relation_to_anchor="anchor",
+            reason_codes=["relation:anchor"],
+            supporting_chunks=[{"chunk_id": "c2", "chunk_index": 1, "page_index": 2, "chunk_text": "support query chunk"}],
+        )
+        doc_sections = {
+            "root": _Stage3TreeSection("root", None, "d1", "n0", "Root", 0, "root summary", "Root"),
+            "focus": _Stage3TreeSection("focus", "root", "d1", "n1", "Focus", 1, "focus summary with query", "Root > Focus"),
+            "child": _Stage3TreeSection("child", "focus", "d1", "n2", "Child", 2, "child summary query", "Root > Focus > Child"),
+            "sib1": _Stage3TreeSection("sib1", "root", "d1", "n3", "Query Sibling", 1, "sibling summary", "Root > Query Sibling"),
+            "sib2": _Stage3TreeSection("sib2", "root", "d1", "n4", "Other Sibling", 1, "other", "Root > Other Sibling"),
+        }
+        children_map = {
+            None: ["root"],
+            "root": ["focus", "sib1", "sib2"],
+            "focus": ["child"],
+        }
+        context_sections = _build_stage4_context_sections(
+            focus_section=focus,
+            doc_sections=doc_sections,
+            children_map=children_map,
+            search_terms=["query"],
+            years=[],
+            quarters=[],
+            max_ancestor_hops=2,
+            max_descendant_depth=1,
+            max_siblings_per_focus=1,
+        )
+        self.assertEqual([item.role for item in context_sections], ["ancestor", "focus", "descendant", "sibling"])
+        self.assertEqual(context_sections[-1].section_id, "sib1")
+
+        focus_chunks = [
+            _Stage4ChunkRow("c1", "d1", "focus", "n1", "Focus", "Root > Focus", 2, 0, "neighbor before"),
+            _Stage4ChunkRow("c2", "d1", "focus", "n1", "Focus", "Root > Focus", 2, 1, "support query chunk"),
+            _Stage4ChunkRow("c3", "d1", "focus", "n1", "Focus", "Root > Focus", 3, 2, "neighbor after"),
+        ]
+        evidence_chunks = _select_stage4_evidence_chunks(
+            focus_section=focus,
+            focus_chunks=focus_chunks,
+            chunk_neighbor_window=1,
+            max_evidence_chunks_per_focus=3,
+        )
+        self.assertEqual([item.role for item in evidence_chunks], ["supporting", "neighbor", "neighbor"])
+        self.assertEqual({item.chunk_id for item in evidence_chunks}, {"c1", "c2", "c3"})
+
+    def test_stage4_answer_context_truncation_preserves_focus_summary(self) -> None:
+        """Stage 4 truncation should preserve the focus summary while dropping lower-priority parts first."""
+        text = _assemble_stage4_answer_context_text(
+            title_path="Root > Focus",
+            context_sections=[
+                ContextSection("a1", "na1", "Ancestor", 0, "Root", "ancestor summary", "ancestor"),
+                ContextSection("f1", "nf1", "Focus", 1, "Root > Focus", "focus summary must stay", "focus"),
+                ContextSection("s1", "ns1", "Sibling", 1, "Root > Sibling", "sibling summary should drop", "sibling"),
+            ],
+            evidence_chunks=[
+                ContextChunk("c1", "f1", 0, 2, "supporting chunk should stay if possible", "supporting"),
+                ContextChunk("c2", "f1", 1, 2, "neighbor chunk should drop first", "neighbor"),
+            ],
+            context_char_budget=140,
+        )
+        self.assertIn("focus summary must stay", text)
+        self.assertNotIn("neighbor chunk should drop first", text)
+
+    def test_stage5_packaging_deduplicates_and_applies_caps(self) -> None:
+        """Stage 5 heuristic packaging should deduplicate focus sections and honor caps."""
+        expanded_docs = [
+            ExpandedDoc(
+                doc_id="d1",
+                doc_score=1.0,
+                expanded_contexts=[
+                    ExpandedContext(
+                        doc_id="d1",
+                        focus_section_id="s1",
+                        focus_node_id="n1",
+                        focus_title="Focus A",
+                        focus_localization_score=4.0,
+                        context_sections=[
+                            ContextSection("s1", "n1", "Focus A", 1, "Root > Focus A", "summary alpha", "focus")
+                        ],
+                        evidence_chunks=[
+                            ContextChunk("c1", "s1", 0, 1, "alpha", "supporting"),
+                            ContextChunk("c2", "s1", 1, 2, "beta", "neighbor"),
+                        ],
+                        answer_context_text="context a",
+                    ),
+                    ExpandedContext(
+                        doc_id="d1",
+                        focus_section_id="s1",
+                        focus_node_id="n1",
+                        focus_title="Focus A duplicate",
+                        focus_localization_score=3.0,
+                        context_sections=[
+                            ContextSection("s1", "n1", "Focus A", 1, "Root > Focus A", "summary alpha", "focus")
+                        ],
+                        evidence_chunks=[],
+                        answer_context_text="context a duplicate",
+                    ),
+                ],
+            ),
+            ExpandedDoc(
+                doc_id="d2",
+                doc_score=0.8,
+                expanded_contexts=[
+                    ExpandedContext(
+                        doc_id="d2",
+                        focus_section_id="s2",
+                        focus_node_id="n2",
+                        focus_title="Focus B",
+                        focus_localization_score=2.0,
+                        context_sections=[
+                            ContextSection("s2", "n2", "Focus B", 1, "Root > Focus B", "summary beta", "focus")
+                        ],
+                        evidence_chunks=[ContextChunk("c3", "s2", 0, 3, "gamma", "supporting")],
+                        answer_context_text="context b",
+                    )
+                ],
+            ),
+        ]
+        evidence_items, evidence_docs = _build_evidence_items(
+            query_understanding=QueryUnderstanding(
+                raw_query="alpha",
+                normalized_query="alpha",
+                language="en",
+                intent="general",
+                terms=["alpha"],
+                metrics=[],
+                regions=[],
+                platforms=[],
+                genres=[],
+                time_scope={"years": [], "quarters": [], "raw_mentions": []},
+                llm_enriched=False,
+            ),
+            expanded_docs=expanded_docs,
+            top_k_evidence_per_doc=1,
+            top_k_total_evidence=1,
+        )
+        self.assertEqual(len(evidence_items), 1)
+        self.assertEqual(len(evidence_docs), 1)
+        self.assertEqual(evidence_items[0].relationship_label, "unlabeled")
+        self.assertEqual(evidence_items[0].page_indexes, [1, 2])
+        self.assertEqual(evidence_items[0].supporting_chunk_ids, ["c1"])
+
+    def test_stage5_hybrid_labeling_accepts_valid_ids_and_ignores_invalid(self) -> None:
+        """Stage 5 hybrid labeling should only apply labels to known shortlisted evidence IDs."""
+        evidence_items = [
+            EvidenceItem(
+                evidence_id="e1",
+                doc_id="d1",
+                focus_section_id="s1",
+                focus_node_id="n1",
+                title="Focus A",
+                title_path="Root > Focus A",
+                evidence_score=3.0,
+                page_indexes=[1],
+                supporting_chunk_ids=["c1"],
+                context_section_ids=["s1"],
+                answer_context_text="context a",
+                relationship_label="unlabeled",
+                relationship_reason="",
+            ),
+            EvidenceItem(
+                evidence_id="e2",
+                doc_id="d2",
+                focus_section_id="s2",
+                focus_node_id="n2",
+                title="Focus B",
+                title_path="Root > Focus B",
+                evidence_score=2.0,
+                page_indexes=[2],
+                supporting_chunk_ids=["c2"],
+                context_section_ids=["s2"],
+                answer_context_text="context b",
+                relationship_label="unlabeled",
+                relationship_reason="",
+            ),
+        ]
+
+        class _FakeStage5ChatClient:
+            def completion(self, _model: str, _prompt: str) -> str:
+                return json.dumps(
+                    {
+                        "labeled_evidence": [
+                            {"evidence_id": "e1", "relationship_label": "supports", "relationship_reason": "fits"},
+                            {"evidence_id": "missing", "relationship_label": "conflicts", "relationship_reason": "ignore"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+        labeled = _label_evidence_items_with_llm(
+            query_understanding=QueryUnderstanding(
+                raw_query="query",
+                normalized_query="query",
+                language="en",
+                intent="general",
+                terms=["query"],
+                metrics=[],
+                regions=[],
+                platforms=[],
+                genres=[],
+                time_scope={"years": [], "quarters": [], "raw_mentions": []},
+                llm_enriched=False,
+            ),
+            evidence_items=evidence_items,
+            relation_shortlist_size=2,
+            llm_client=_FakeStage5ChatClient(),
+            relation_model="dashscope/qwen3.6-plus",
+            debug_recorder=None,
+        )
+        self.assertEqual(labeled[0].relationship_label, "supports")
+        self.assertEqual(labeled[0].relationship_reason, "fits")
+        self.assertEqual(labeled[1].relationship_label, "unlabeled")
 
 
 if __name__ == "__main__":

@@ -141,6 +141,8 @@ Current implementation note:
 
 - this remains the documented fallback strategy
 - current code still keeps section-level Stage 2 output available, so switching between doc-entry-only and anchor-first is mostly an orchestration choice
+- all current tuning knobs across Stage 1 through Stage 5 now live in:
+  - `/Users/weichong/Documents/new_working_area/file_tree/DemoIndex/docs/retrieval_config.md`
 
 ### Stage 4: Whole-Tree Search
 
@@ -157,6 +159,12 @@ The difference is only the entry policy.
 
 This is why the plan is closer to public PageIndex examples than Plan A:
 the selected document is treated as one retrieval entry, and the tree search reasons over the full structure from the beginning.
+
+Current implementation note:
+
+- current code now implements Stage 4 and Stage 5 on the anchor-first primary plan
+- this doc-entry-only plan is still the baseline fallback design
+- if we later expose it as a first-class runtime mode, Stage 4 and Stage 5 can reuse the same expansion and packaging contracts with a different Stage 3 entry policy
 
 ## Why This Plan Exists
 

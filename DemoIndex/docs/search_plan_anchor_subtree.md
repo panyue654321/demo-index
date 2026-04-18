@@ -185,6 +185,15 @@ Current implementation note:
   - `rerank_fallback_model`
   - `stage3_shortlist_size`
   - `stage3_relation_priors`
+- Stage 4 context expansion is now implemented as a deterministic pass on top of Stage 3
+- Stage 4 currently expands:
+  - focus section
+  - bounded ancestor chain
+  - bounded descendant subtree
+  - bounded sibling set
+  - supporting chunks plus chunk neighbors
+- Stage 4 tuning now lives in the consolidated config doc:
+  - `/Users/weichong/Documents/new_working_area/file_tree/DemoIndex/docs/retrieval_config.md`
 
 ### Stage 5: Evidence Aggregation
 
@@ -201,6 +210,17 @@ Then preserve:
 - supporting evidence
 - conflicting evidence
 - scope conditions
+
+Current implementation note:
+
+- Stage 5 is now implemented as evidence packaging on top of Stage 4 expanded contexts
+- Stage 5 supports:
+  - `heuristic`
+  - `hybrid`
+- `heuristic` packages final evidence items without extra relation labeling
+- `hybrid` keeps the same package shape and adds one global LLM relation-labeling pass over the shortlisted evidence items
+- Stage 5 tuning now lives in the consolidated config doc:
+  - `/Users/weichong/Documents/new_working_area/file_tree/DemoIndex/docs/retrieval_config.md`
 
 ## Why This Plan Exists
 

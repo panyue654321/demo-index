@@ -47,6 +47,27 @@ def retrieve_tree_candidates(*args: Any, **kwargs: Any):
     return _retrieve_tree_candidates(*args, **kwargs)
 
 
+def expand_localized_sections(*args: Any, **kwargs: Any):
+    """Run Stage 4 context expansion over an existing Stage 3 result."""
+    from .retrieval import expand_localized_sections as _expand_localized_sections
+
+    return _expand_localized_sections(*args, **kwargs)
+
+
+def package_evidence(*args: Any, **kwargs: Any):
+    """Run Stage 5 evidence packaging over an existing Stage 4 result."""
+    from .retrieval import package_evidence as _package_evidence
+
+    return _package_evidence(*args, **kwargs)
+
+
+def retrieve_evidence(*args: Any, **kwargs: Any):
+    """Run Stage 1 through Stage 5 retrieval and return packaged evidence."""
+    from .retrieval import retrieve_evidence as _retrieve_evidence
+
+    return _retrieve_evidence(*args, **kwargs)
+
+
 __all__ = [
     "build_pageindex_tree",
     "compare_tree",
@@ -54,4 +75,7 @@ __all__ = [
     "retrieve_candidates",
     "localize_sections",
     "retrieve_tree_candidates",
+    "expand_localized_sections",
+    "package_evidence",
+    "retrieve_evidence",
 ]

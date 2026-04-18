@@ -23,7 +23,7 @@ def _maybe_reexec_into_pageindex_venv() -> None:
         if (
             "--write-postgres" in sys.argv
             or "--write-global-index" in sys.argv
-            or (len(sys.argv) > 1 and sys.argv[1] in {"retrieve", "retrieve-tree"})
+            or (len(sys.argv) > 1 and sys.argv[1] in {"retrieve", "retrieve-tree", "retrieve-evidence"})
         ):
             import psycopg  # noqa: F401
     except Exception:
@@ -39,7 +39,7 @@ def _maybe_reexec_into_pageindex_venv() -> None:
 _maybe_reexec_into_pageindex_venv()
 
 from .pipeline import build_pageindex_tree, compare_tree
-from .retrieval import retrieve_candidates, retrieve_tree_candidates
+from .retrieval import retrieve_candidates, retrieve_evidence, retrieve_tree_candidates
 
 
 def _parse_json_object_arg(value: str | None, *, arg_name: str) -> dict[str, float] | None:
@@ -329,6 +329,213 @@ def _parse_args() -> argparse.Namespace:
         help="Optional JSON object overriding Stage 3 relation priors.",
     )
 
+    retrieve_evidence_parser = subparsers.add_parser(
+        "retrieve-evidence",
+        help="Run Stage 1 through Stage 5 retrieval and package final evidence.",
+    )
+    retrieve_evidence_parser.add_argument("--query", required=True, help="Search query text.")
+    retrieve_evidence_parser.add_argument("--output-json", default=None, help="Optional output JSON path.")
+    retrieve_evidence_parser.add_argument("--top-k-dense", type=int, default=60, help="Dense ANN recall limit.")
+    retrieve_evidence_parser.add_argument("--top-k-lexical", type=int, default=60, help="Lexical recall limit.")
+    retrieve_evidence_parser.add_argument(
+        "--top-k-fused-chunks",
+        type=int,
+        default=80,
+        help="Final fused chunk candidate limit.",
+    )
+    retrieve_evidence_parser.add_argument("--top-k-docs", type=int, default=10, help="Document candidate limit.")
+    retrieve_evidence_parser.add_argument(
+        "--top-k-sections-per-doc",
+        type=int,
+        default=3,
+        help="Section anchor limit per selected document.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--top-k-chunks-per-section",
+        type=int,
+        default=2,
+        help="Supporting chunk limit per selected section.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage3-mode",
+        choices=("heuristic", "hybrid"),
+        default="hybrid",
+        help="Stage 3 localization mode.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--top-k-tree-sections-per-doc",
+        type=int,
+        default=5,
+        help="Final localized section limit per selected document.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--top-k-anchor-sections-per-doc",
+        type=int,
+        default=3,
+        help="Anchor section limit per selected document.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--disable-whole-doc-fallback",
+        action="store_true",
+        help="Disable whole-document fallback when the anchor-local pool is too small.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--disable-llm-parse",
+        action="store_true",
+        help="Disable optional query-time LLM enrichment.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--parse-model",
+        default="dashscope/qwen3.6-plus",
+        help="DashScope chat model used for query-time LLM parsing.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--parse-fallback-model",
+        default="dashscope/qwen3.5-plus",
+        help="Fallback DashScope chat model for query-time parsing.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--embedding-model",
+        default="text-embedding-v4",
+        help="Embedding model used for dense retrieval.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--rrf-k",
+        type=int,
+        default=60,
+        help="Reciprocal rank fusion constant.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--lexical-score-threshold",
+        type=float,
+        default=0.18,
+        help="Minimum lexical similarity threshold for candidate generation.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--doc-score-chunk-limit",
+        type=int,
+        default=5,
+        help="How many top fused chunks contribute to each doc score.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--section-score-chunk-limit",
+        type=int,
+        default=3,
+        help="How many top fused chunks contribute to each section score.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--retrieval-profile-path",
+        default=None,
+        help="Optional retrieval profile JSON path overriding DEMOINDEX_RETRIEVAL_PROFILE_PATH.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--debug-log",
+        action="store_true",
+        help="Write structured retrieval debug logs and timings.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--debug-log-dir",
+        default=None,
+        help="Optional directory for retrieval debug logs.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage3-rerank-model",
+        default="dashscope/qwen3.6-plus",
+        help="DashScope chat model used for Stage 3 hybrid rerank.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage3-rerank-fallback-model",
+        default="dashscope/qwen3.5-plus",
+        help="Fallback DashScope chat model for Stage 3 rerank.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage3-shortlist-size",
+        type=int,
+        default=8,
+        help="Shortlist size per document before Stage 3 hybrid rerank.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage3-relation-priors-json",
+        default=None,
+        help="Optional JSON object overriding Stage 3 relation priors.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--top-k-focus-sections-per-doc",
+        type=int,
+        default=3,
+        help="How many localized sections per doc enter Stage 4 expansion.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--max-ancestor-hops",
+        type=int,
+        default=2,
+        help="Maximum ancestor hops to include for each focus section.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--max-descendant-depth",
+        type=int,
+        default=1,
+        help="Maximum descendant depth to include for each focus section.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--max-siblings-per-focus",
+        type=int,
+        default=2,
+        help="Maximum sibling sections to include for each focus section.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--chunk-neighbor-window",
+        type=int,
+        default=1,
+        help="Neighbor window around supporting chunks inside the focus section.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--max-evidence-chunks-per-focus",
+        type=int,
+        default=6,
+        help="Maximum evidence chunks kept for each focus section.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--context-char-budget",
+        type=int,
+        default=6000,
+        help="Character budget for each Stage 4 answer-ready context.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage5-relation-mode",
+        choices=("heuristic", "hybrid"),
+        default="heuristic",
+        help="Stage 5 relation-labeling mode.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--top-k-evidence-per-doc",
+        type=int,
+        default=3,
+        help="Maximum evidence items kept per document in Stage 5.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--top-k-total-evidence",
+        type=int,
+        default=8,
+        help="Maximum evidence items kept overall in Stage 5.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage5-relation-model",
+        default="dashscope/qwen3.6-plus",
+        help="DashScope chat model used for Stage 5 hybrid relation labeling.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage5-relation-fallback-model",
+        default="dashscope/qwen3.5-plus",
+        help="Fallback DashScope chat model for Stage 5 relation labeling.",
+    )
+    retrieve_evidence_parser.add_argument(
+        "--stage5-relation-shortlist-size",
+        type=int,
+        default=8,
+        help="How many evidence items enter the Stage 5 hybrid relation-labeling pass.",
+    )
+
     return parser.parse_args()
 
 
@@ -398,7 +605,7 @@ def main() -> int:
             debug_log=args.debug_log,
             debug_log_dir=args.debug_log_dir,
         )
-    else:
+    elif args.command == "retrieve-tree":
         result = retrieve_tree_candidates(
             query=args.query,
             top_k_dense=args.top_k_dense,
@@ -427,6 +634,51 @@ def main() -> int:
                 args.stage3_relation_priors_json,
                 arg_name="--stage3-relation-priors-json",
             ),
+            debug_log=args.debug_log,
+            debug_log_dir=args.debug_log_dir,
+        )
+    else:
+        result = retrieve_evidence(
+            query=args.query,
+            top_k_dense=args.top_k_dense,
+            top_k_lexical=args.top_k_lexical,
+            top_k_fused_chunks=args.top_k_fused_chunks,
+            top_k_docs=args.top_k_docs,
+            top_k_sections_per_doc=args.top_k_sections_per_doc,
+            top_k_chunks_per_section=args.top_k_chunks_per_section,
+            use_llm_parse=not args.disable_llm_parse,
+            parse_model=args.parse_model,
+            parse_fallback_model=args.parse_fallback_model,
+            embedding_model=args.embedding_model,
+            rrf_k=args.rrf_k,
+            lexical_score_threshold=args.lexical_score_threshold,
+            doc_score_chunk_limit=args.doc_score_chunk_limit,
+            section_score_chunk_limit=args.section_score_chunk_limit,
+            retrieval_profile_path=args.retrieval_profile_path,
+            stage3_mode=args.stage3_mode,
+            top_k_tree_sections_per_doc=args.top_k_tree_sections_per_doc,
+            top_k_anchor_sections_per_doc=args.top_k_anchor_sections_per_doc,
+            whole_doc_fallback=not args.disable_whole_doc_fallback,
+            rerank_model=args.stage3_rerank_model,
+            rerank_fallback_model=args.stage3_rerank_fallback_model,
+            stage3_shortlist_size=args.stage3_shortlist_size,
+            stage3_relation_priors=_parse_json_object_arg(
+                args.stage3_relation_priors_json,
+                arg_name="--stage3-relation-priors-json",
+            ),
+            top_k_focus_sections_per_doc=args.top_k_focus_sections_per_doc,
+            max_ancestor_hops=args.max_ancestor_hops,
+            max_descendant_depth=args.max_descendant_depth,
+            max_siblings_per_focus=args.max_siblings_per_focus,
+            chunk_neighbor_window=args.chunk_neighbor_window,
+            max_evidence_chunks_per_focus=args.max_evidence_chunks_per_focus,
+            context_char_budget=args.context_char_budget,
+            stage5_relation_mode=args.stage5_relation_mode,
+            top_k_evidence_per_doc=args.top_k_evidence_per_doc,
+            top_k_total_evidence=args.top_k_total_evidence,
+            stage5_relation_model=args.stage5_relation_model,
+            stage5_relation_fallback_model=args.stage5_relation_fallback_model,
+            stage5_relation_shortlist_size=args.stage5_relation_shortlist_size,
             debug_log=args.debug_log,
             debug_log_dir=args.debug_log_dir,
         )
